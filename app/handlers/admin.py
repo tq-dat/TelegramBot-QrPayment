@@ -16,23 +16,26 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 from aiogram import Router, F
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings, PLANS
+from app.config import settings
 from app.database import AsyncSessionLocal
-from app.keyboards.admin import admin_panel_kb, admin_cancel_kb
+from app.keyboards.admin import admin_panel_kb, admin_cancel_kb, plans_list_kb
 from app.models.audit_log import AuditLog
 from app.models.order import Order
+from app.models.plan import Plan
 from app.models.subscription import Subscription
 from app.models.user import User
 from app.utils.invite import create_single_use_invite
 from app.utils.payment import activate_subscription
+from app.utils.plan_loader import get_plan, get_all_plans, slugify
 from app.utils.report import generate_report
+from app.scheduler import _kick_expired_users
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -43,10 +46,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class AdminFSM(StatesGroup):
-    confirm_order = State()   # waiting for "order_code transaction_id"
+    confirm_order = State()   # waiting for "order_code"
     give_days = State()       # waiting for "user_id days"
     ban_user = State()        # waiting for "user_id [reason]"
     refund_note = State()     # waiting for "order_code note..."
+    add_plan = State()        # waiting for "name|days|price|emoji"
+    edit_plan = State()       # waiting for "name|days|price|emoji" (plan code stored in FSM data)
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +60,11 @@ class AdminFSM(StatesGroup):
 
 def _is_admin(user_id: int) -> bool:
     return user_id in settings.admin_id_list
+
+
+def _not_command(message: Message) -> bool:
+    """Filter: True when the message is NOT a bot command (does not start with /)."""
+    return not (message.text and message.text.startswith("/"))
 
 
 async def _guard(message_or_cb) -> bool:
@@ -75,8 +85,9 @@ async def _guard(message_or_cb) -> bool:
 # /admin entry point
 # ---------------------------------------------------------------------------
 
-@router.message(Command("admin"))
-async def cmd_admin(message: Message) -> None:
+@router.message(Command("admin"), StateFilter("*"))
+async def cmd_admin(message: Message, state: FSMContext) -> None:
+    await state.clear()
     if not await _guard(message):
         return
     await message.answer(
@@ -104,7 +115,6 @@ async def cb_adm_members(callback: CallbackQuery, session: AsyncSession) -> None
         .where(Subscription.is_active.is_(True))
         .where(Subscription.expires_at > now)
         .order_by(Subscription.expires_at.asc())
-        .limit(30)
     )
     rows = result.all()
 
@@ -115,11 +125,21 @@ async def cb_adm_members(callback: CallbackQuery, session: AsyncSession) -> None
         )
         return
 
-    lines = ["👥 <b>Active members (max 30):</b>\n"]
+    # Deduplicate: keep only the latest-expiring subscription per user
+    latest: dict[int, tuple] = {}
     for sub, user in rows:
+        existing = latest.get(user.id)
+        if existing is None or sub.expires_at > existing[0].expires_at:
+            latest[user.id] = (sub, user)
+
+    # Sort by expires_at asc, cap at 30
+    unique_rows = sorted(latest.values(), key=lambda t: t[0].expires_at)
+
+    lines = ["👥 <b>Active members:</b>\n"]
+    for sub, user in unique_rows:
         days_left = max(0, (sub.expires_at - now).days)
         name = f"@{user.username}" if user.username else user.first_name
-        plan = PLANS.get(sub.plan_code, {})
+        plan = await get_plan(session, sub.plan_code) or {}
         lines.append(
             f"• {name} (<code>{user.id}</code>) — "
             f"{plan.get('emoji','')}{plan.get('name', sub.plan_code)} "
@@ -153,10 +173,13 @@ async def cb_adm_pending(callback: CallbackQuery, session: AsyncSession) -> None
         )
         return
 
+    all_plans = await get_all_plans(session)
+    plans_map = {p["code"]: p for p in all_plans}
+
     lines = ["📋 <b>Đơn pending (max 20):</b>\n"]
     for order, user in rows:
         name = f"@{user.username}" if user.username else user.first_name
-        plan = PLANS.get(order.plan_code, {})
+        plan = plans_map.get(order.plan_code, {})
         age_min = int((datetime.now(timezone.utc) - order.created_at).total_seconds() / 60)
         lines.append(
             f"• <code>{order.order_code}</code> — {name} — "
@@ -188,7 +211,7 @@ async def cb_adm_confirm_start(callback: CallbackQuery, state: FSMContext) -> No
     )
 
 
-@router.message(AdminFSM.confirm_order)
+@router.message(AdminFSM.confirm_order, _not_command)
 async def fsm_confirm_order(message: Message, state: FSMContext) -> None:
     if not _is_admin(message.from_user.id):
         return
@@ -237,7 +260,8 @@ async def fsm_confirm_order(message: Message, state: FSMContext) -> None:
         await session.commit()
 
     # Notify user
-    plan = PLANS.get(order.plan_code, {})
+    async with AsyncSessionLocal() as _s:
+        plan = await get_plan(_s, order.plan_code) or {}
     user_text = (
         "✅ <b>Thanh toán đã được xác nhận bởi admin!</b>\n\n"
         f"{plan.get('emoji','🎫')} Gói: <b>{plan.get('name', order.plan_code)}</b>\n"
@@ -283,7 +307,7 @@ async def cb_adm_givedays_start(callback: CallbackQuery, state: FSMContext) -> N
     )
 
 
-@router.message(AdminFSM.give_days)
+@router.message(AdminFSM.give_days, _not_command)
 async def fsm_give_days(message: Message, state: FSMContext) -> None:
     if not _is_admin(message.from_user.id):
         return
@@ -380,7 +404,7 @@ async def cb_adm_ban_start(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
 
-@router.message(AdminFSM.ban_user)
+@router.message(AdminFSM.ban_user, _not_command)
 async def fsm_ban_user(message: Message, state: FSMContext) -> None:
     if not _is_admin(message.from_user.id):
         return
@@ -448,7 +472,7 @@ async def cb_adm_refund_start(callback: CallbackQuery, state: FSMContext) -> Non
     )
 
 
-@router.message(AdminFSM.refund_note)
+@router.message(AdminFSM.refund_note, _not_command)
 async def fsm_refund_note(message: Message, state: FSMContext) -> None:
     if not _is_admin(message.from_user.id):
         return
@@ -516,12 +540,29 @@ async def cb_adm_report_weekly(callback: CallbackQuery, session: AsyncSession) -
     await callback.message.answer("🛠 <b>Admin Panel</b>", reply_markup=admin_panel_kb(), parse_mode="HTML")
 
 
-@router.message(Command("baocao"))
-async def cmd_baocao(message: Message, session: AsyncSession) -> None:
+@router.callback_query(F.data == "adm_report_monthly")
+async def cb_adm_report_monthly(callback: CallbackQuery, session: AsyncSession) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("🚫 Không có quyền.", show_alert=True)
+        return
+    await callback.answer()
+    text = await generate_report("monthly", session)
+    await callback.message.answer(text, parse_mode="HTML")
+    await callback.message.answer("🛠 <b>Admin Panel</b>", reply_markup=admin_panel_kb(), parse_mode="HTML")
+
+
+@router.message(Command("baocao"), StateFilter("*"))
+async def cmd_baocao(message: Message, session: AsyncSession, state: FSMContext) -> None:
+    await state.clear()
     if not await _guard(message):
         return
     arg = (message.text or "").strip().split()[-1].lower() if len((message.text or "").split()) > 1 else "daily"
-    period = "weekly" if arg == "weekly" else "daily"
+    if arg == "weekly":
+        period = "weekly"
+    elif arg in ("monthly", "thang", "tháng"):
+        period = "monthly"
+    else:
+        period = "daily"
     text = await generate_report(period, session)
     await message.answer(text, parse_mode="HTML")
 
@@ -540,3 +581,289 @@ async def cb_adm_cancel_fsm(callback: CallbackQuery, state: FSMContext) -> None:
         reply_markup=admin_panel_kb(),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data == "adm_back")
+async def cb_adm_back(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await callback.message.edit_text(
+        "🛠 <b>Admin Panel</b>\n\nChọn thao tác:",
+        reply_markup=admin_panel_kb(),
+        parse_mode="HTML",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test: manually trigger auto-kick (admin only)
+# ---------------------------------------------------------------------------
+
+# @router.message(Command("testkick"), StateFilter("*"))
+# async def cmd_testkick(message: Message, state: FSMContext) -> None:
+#     await state.clear()
+#     if not await _guard(message):
+#         return
+#     await message.answer("⏳ Đang chạy auto-kick thủ công...")
+#     await _kick_expired_users(message.bot)
+#     await message.answer("✅ Hoàn tất. Kiểm tra log để xem kết quả.")
+
+
+# ---------------------------------------------------------------------------
+# Plan management
+# ---------------------------------------------------------------------------
+
+async def _show_plans_list(target, session: AsyncSession) -> None:
+    """Send/edit the plans list with CRUD keyboard. target = Message or CallbackQuery."""
+    plans = await get_all_plans(session)
+    text = "📦 <b>Quản lý gói</b>\n\nDanh sách gói hiện tại:"
+    kb = plans_list_kb(plans)
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "adm_plans")
+async def cb_adm_plans(callback: CallbackQuery, session: AsyncSession) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("🚫 Không có quyền.", show_alert=True)
+        return
+    await callback.answer()
+    await _show_plans_list(callback, session)
+
+
+@router.callback_query(F.data == "adm_plan_noop")
+async def cb_adm_plan_noop(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+
+# --- Add plan ---
+
+@router.callback_query(F.data == "adm_plan_add")
+async def cb_adm_plan_add(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("🚫 Không có quyền.", show_alert=True)
+        return
+    await callback.answer()
+    await state.set_state(AdminFSM.add_plan)
+    await callback.message.answer(
+        "➕ <b>Thêm gói mới</b>\n\n"
+        "Nhập theo định dạng:\n"
+        "<code>Tên gói|số ngày|giá VND|emoji|thứ tự</code>\n\n"
+        "Ví dụ: <code>VIP 7 ngày|7|150000|🌟|5</code>\n"
+        "<i>(thứ tự hiển thị là tùy chọn, mặc định = 0)</i>",
+        reply_markup=admin_cancel_kb(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminFSM.add_plan, _not_command)
+async def fsm_add_plan(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+
+    parts = [p.strip() for p in message.text.strip().split("|")]
+    if len(parts) < 3:
+        await message.answer(
+            "⚠️ Sai định dạng. Nhập: <code>Tên|ngày|giá|emoji|thứ tự</code>",
+            parse_mode="HTML",
+            reply_markup=admin_cancel_kb(),
+        )
+        return
+
+    name = parts[0]
+    try:
+        days = int(parts[1])
+        price = int(parts[2])
+    except ValueError:
+        await message.answer(
+            "⚠️ Số ngày và giá phải là số nguyên.",
+            reply_markup=admin_cancel_kb(),
+        )
+        return
+
+    emoji = parts[3] if len(parts) > 3 else "🎫"
+    sort_order = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
+    code = slugify(name)
+
+    # Ensure code is unique
+    existing = await session.execute(select(Plan).where(Plan.code == code))
+    if existing.scalar_one_or_none():
+        code = f"{code}_{days}"
+
+    plan = Plan(
+        code=code,
+        name=name,
+        days=days,
+        price=price,
+        emoji=emoji,
+        sort_order=sort_order,
+        is_visible=True,
+    )
+    session.add(plan)
+    session.add(AuditLog(
+        admin_id=message.from_user.id,
+        action="add_plan",
+        target_user_id=None,
+        detail={"code": code, "name": name, "days": days, "price": price},
+    ))
+    await session.commit()
+    await state.clear()
+
+    await message.answer(
+        f"✅ Đã thêm gói <b>{emoji} {name}</b> (<code>{code}</code>) — "
+        f"{days} ngày — {price:,}đ\n\nHiện trong danh sách gói.",
+        parse_mode="HTML",
+    )
+    await _show_plans_list(message, session)
+    logger.info("plan added", extra={"code": code, "admin": message.from_user.id})
+
+
+# --- Edit plan ---
+
+@router.callback_query(F.data.startswith("adm_plan_edit_"))
+async def cb_adm_plan_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("🚫 Không có quyền.", show_alert=True)
+        return
+    code = callback.data.removeprefix("adm_plan_edit_")
+    await callback.answer()
+    await state.set_state(AdminFSM.edit_plan)
+    await state.update_data(edit_plan_code=code)
+    await callback.message.answer(
+        f"✏️ <b>Sửa gói</b> <code>{code}</code>\n\n"
+        "Nhập giá trị mới:\n"
+        "<code>Tên gói|số ngày|giá VND|emoji|thứ tự</code>\n\n"
+        "Ví dụ: <code>Basic Plus|30|550000|⭐|1</code>",
+        reply_markup=admin_cancel_kb(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminFSM.edit_plan, _not_command)
+async def fsm_edit_plan(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+
+    data = await state.get_data()
+    code = data.get("edit_plan_code")
+    await state.clear()
+
+    parts = [p.strip() for p in message.text.strip().split("|")]
+    if len(parts) < 3:
+        await message.answer(
+            "⚠️ Sai định dạng. Nhập: <code>Tên|ngày|giá|emoji|thứ tự</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    result = await session.execute(select(Plan).where(Plan.code == code))
+    plan = result.scalar_one_or_none()
+    if not plan:
+        await message.answer(f"❌ Không tìm thấy gói <code>{code}</code>.", parse_mode="HTML")
+        return
+
+    try:
+        plan.name = parts[0]
+        plan.days = int(parts[1])
+        plan.price = int(parts[2])
+        if len(parts) > 3:
+            plan.emoji = parts[3]
+        if len(parts) > 4 and parts[4].isdigit():
+            plan.sort_order = int(parts[4])
+    except ValueError:
+        await message.answer("⚠️ Số ngày và giá phải là số nguyên.")
+        return
+
+    session.add(AuditLog(
+        admin_id=message.from_user.id,
+        action="edit_plan",
+        target_user_id=None,
+        detail={"code": code, "name": plan.name, "days": plan.days, "price": plan.price},
+    ))
+    await session.commit()
+    await message.answer(
+        f"✅ Đã cập nhật gói <b>{plan.emoji} {plan.name}</b> (<code>{code}</code>).",
+        parse_mode="HTML",
+    )
+    await _show_plans_list(message, session)
+    logger.info("plan edited", extra={"code": code, "admin": message.from_user.id})
+
+
+# --- Toggle visibility ---
+
+@router.callback_query(F.data.startswith("adm_plan_toggle_"))
+async def cb_adm_plan_toggle(callback: CallbackQuery, session: AsyncSession) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("🚫 Không có quyền.", show_alert=True)
+        return
+    code = callback.data.removeprefix("adm_plan_toggle_")
+    await callback.answer()
+
+    result = await session.execute(select(Plan).where(Plan.code == code))
+    plan = result.scalar_one_or_none()
+    if not plan:
+        await callback.message.answer(f"❌ Không tìm thấy gói <code>{code}</code>.", parse_mode="HTML")
+        return
+
+    plan.is_visible = not plan.is_visible
+    action = "hiện" if plan.is_visible else "ẩn"
+    session.add(AuditLog(
+        admin_id=callback.from_user.id,
+        action=f"toggle_plan_{action}",
+        target_user_id=None,
+        detail={"code": code},
+    ))
+    await session.commit()
+    await _show_plans_list(callback, session)
+    logger.info("plan toggled", extra={"code": code, "is_visible": plan.is_visible, "admin": callback.from_user.id})
+
+
+# --- Delete plan ---
+
+@router.callback_query(F.data.startswith("adm_plan_del_"))
+async def cb_adm_plan_del(callback: CallbackQuery, session: AsyncSession) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("🚫 Không có quyền.", show_alert=True)
+        return
+    code = callback.data.removeprefix("adm_plan_del_")
+    await callback.answer()
+
+    # Check for active subscriptions with this plan
+    now = datetime.now(timezone.utc)
+    active_count_result = await session.execute(
+        select(Subscription)
+        .where(Subscription.plan_code == code)
+        .where(Subscription.is_active.is_(True))
+        .where(Subscription.expires_at > now)
+    )
+    active_subs = active_count_result.scalars().all()
+
+    if active_subs:
+        await callback.message.answer(
+            f"⚠️ Không thể xóa gói <code>{code}</code> vì có "
+            f"<b>{len(active_subs)} subscription đang active</b>.\n\n"
+            "💡 Hãy dùng nút <b>\ud83d\udc41 Ẩn</b> thay vì xóa.",
+            parse_mode="HTML",
+        )
+        return
+
+    result = await session.execute(select(Plan).where(Plan.code == code))
+    plan = result.scalar_one_or_none()
+    if not plan:
+        await callback.message.answer(f"❌ Không tìm thấy gói <code>{code}</code>.", parse_mode="HTML")
+        return
+
+    await session.delete(plan)
+    session.add(AuditLog(
+        admin_id=callback.from_user.id,
+        action="delete_plan",
+        target_user_id=None,
+        detail={"code": code, "name": plan.name},
+    ))
+    await session.commit()
+    await callback.message.answer(
+        f"✅ Đã xóa gói <b>{plan.name}</b> (<code>{code}</code>).",
+        parse_mode="HTML",
+    )
+    await _show_plans_list(callback, session)
+    logger.info("plan deleted", extra={"code": code, "admin": callback.from_user.id})

@@ -4,7 +4,8 @@ from datetime import datetime, timezone, timedelta
 
 from aiogram import Router, F
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, CallbackQuery, BufferedInputFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -12,29 +13,12 @@ from sqlalchemy import select
 from app.messages.templates import Msg
 from app.keyboards.menus import plan_selection_kb, after_order_kb, PlanSelectCb
 from app.models.order import Order
-from app.config import PLANS, settings
+from app.config import settings
 from app.utils.order import generate_order_code, build_transfer_description, format_vnd
 from app.utils.user import get_or_create_user
-from app.utils.payment import generate_vietqr_image, monitor_payment
+from app.utils.payment import generate_vietqr_image, monitor_payment, _notify_admins_new_order
+from app.utils.plan_loader import get_plan, get_visible_plans
 
-
-async def _notify_admins_new_order(bot, order: Order, username: str | None) -> None:
-    """Send a new-order alert to all configured admin IDs."""
-    plan = PLANS.get(order.plan_code, {})
-    name_str = f"@{username}" if username else f"id:{order.user_id}"
-    text = (
-        "🔔 <b>Đơn hàng mới / New order</b>\n\n"
-        f"👤 User: {name_str} (<code>{order.user_id}</code>)\n"
-        f"{plan.get('emoji','')} Gói / Plan: <b>{plan.get('name', order.plan_code)}</b>\n"
-        f"💰 Số tiền: <b>{order.amount:,}đ</b>\n"
-        f"🔖 Mã đơn: <code>{order.order_code}</code>\n"
-        f"📝 Nội dung CK: <code>{order.transfer_description}</code>"
-    )
-    for admin_id in settings.admin_id_list:
-        try:
-            await bot.send_message(admin_id, text, parse_mode="HTML")
-        except Exception as exc:
-            logger.warning("admin alert failed", extra={"admin_id": admin_id, "error": str(exc)})
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -74,10 +58,11 @@ async def _cancel_pending_orders(user_id: int, session: AsyncSession) -> None:
 # Entry points: /giahan command + "Gia hạn" button
 # ---------------------------------------------------------------------------
 
-@router.message(Command("giahan"))
-async def cmd_giahan(message: Message, session: AsyncSession) -> None:
+@router.message(Command("giahan"), StateFilter("*"))
+async def cmd_giahan(message: Message, session: AsyncSession, state: FSMContext) -> None:
+    await state.clear()
     await get_or_create_user(message.from_user, session)
-    await message.answer(Msg.SELECT_PLAN, reply_markup=plan_selection_kb())
+    await message.answer(Msg.SELECT_PLAN, reply_markup=await plan_selection_kb(session))
 
 
 @router.callback_query(F.data == "renew_start")
@@ -102,12 +87,12 @@ async def cb_renew_start(callback: CallbackQuery, session: AsyncSession) -> None
         await callback.bot.send_message(
             user_id,
             Msg.SELECT_PLAN,
-            reply_markup=plan_selection_kb(),
+            reply_markup=await plan_selection_kb(session),
             parse_mode="HTML",
         )
     else:
         try:
-            await callback.message.edit_text(Msg.SELECT_PLAN, reply_markup=plan_selection_kb())
+            await callback.message.edit_text(Msg.SELECT_PLAN, reply_markup=await plan_selection_kb(session))
         except TelegramBadRequest:
             pass
 
@@ -123,7 +108,8 @@ async def cb_plan_selected(
     session: AsyncSession,
 ) -> None:
     plan_code = callback_data.plan_code
-    if plan_code not in PLANS:
+    plan = await get_plan(session, plan_code)
+    if not plan:
         await callback.answer("Gói không hợp lệ / Invalid plan.", show_alert=True)
         return
 
@@ -131,7 +117,6 @@ async def cb_plan_selected(
 
     user_id = callback.from_user.id
     username = callback.from_user.username
-    plan = PLANS[plan_code]
 
     # Cancel any existing pending orders for this user
     await _cancel_pending_orders(user_id, session)
@@ -153,6 +138,11 @@ async def cb_plan_selected(
     session.add(order)
     await session.flush()  # get order.id before commit
 
+    # Notify admins about new order immediately (regardless of payment status)
+    asyncio.create_task(
+        _notify_admins_new_order(callback.bot, order, username)
+    )
+
     logger.info(
         "order created",
         extra={
@@ -161,11 +151,6 @@ async def cb_plan_selected(
             "plan": plan_code,
             "amount": plan["price"],
         },
-    )
-
-    # Notify admins of the new pending order (fire-and-forget)
-    asyncio.create_task(
-        _notify_admins_new_order(callback.bot, order, callback.from_user.username)
     )
 
     # Determine if we can generate a QR (requires bank + sieuthicode to be configured)
@@ -218,8 +203,8 @@ async def cb_plan_selected(
         task = asyncio.create_task(
             monitor_payment(
                 order_id=order.id,
+                order_code=order_code,
                 user_id=user_id,
-                memo=transfer_description,
                 amount=plan["price"],
                 bot=callback.bot,
                 watch_seconds=settings.PAYMENT_WATCH_SECONDS,

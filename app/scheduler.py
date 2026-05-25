@@ -11,10 +11,11 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select
 
-from app.config import settings, PLANS
+from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models.subscription import Subscription
 from app.models.user import User
+from app.utils.plan_loader import get_plan
 from app.utils.report import generate_report
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,8 @@ async def _send_expiry_reminders(bot) -> None:
             .where(Subscription.d3_reminder_sent.is_(False))
         )
         for sub in result.scalars().all():
-            plan = PLANS.get(sub.plan_code, {})
+            async with AsyncSessionLocal() as _s:
+                plan = await get_plan(_s, sub.plan_code) or {}
             days_left = max(0, (sub.expires_at - now).days)
             try:
                 await bot.send_message(
@@ -76,7 +78,8 @@ async def _send_expiry_reminders(bot) -> None:
             .where(Subscription.d1_reminder_sent.is_(False))
         )
         for sub in result.scalars().all():
-            plan = PLANS.get(sub.plan_code, {})
+            async with AsyncSessionLocal() as _s:
+                plan = await get_plan(_s, sub.plan_code) or {}
             try:
                 await bot.send_message(
                     sub.user_id,
@@ -148,7 +151,8 @@ async def _kick_expired_users(bot) -> None:
 
             # Notify the user
             try:
-                plan = PLANS.get(sub.plan_code, {})
+                async with AsyncSessionLocal() as _s:
+                    plan = await get_plan(_s, sub.plan_code) or {}
                 await bot.send_message(
                     sub.user_id,
                     (

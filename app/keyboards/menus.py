@@ -1,8 +1,9 @@
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import PLANS
+from app.utils.plan_loader import get_visible_plans
 
 
 # ---------------------------------------------------------------------------
@@ -29,9 +30,10 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def plan_selection_kb() -> InlineKeyboardMarkup:
+async def plan_selection_kb(session: AsyncSession) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for plan in PLANS.values():
+    plans = await get_visible_plans(session)
+    for plan in plans:
         price_str = f"{plan['price']:,}".replace(",", ".")
         label = (
             f"{plan['emoji']} {plan['name']} — "

@@ -6,6 +6,7 @@ from pythonjsonlogger import jsonlogger
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 
 from app.config import settings
 from app.middleware import DbSessionMiddleware
@@ -23,6 +24,33 @@ def setup_logging() -> None:
     root = logging.getLogger()
     root.setLevel(logging.DEBUG if settings.DEBUG else logging.INFO)
     root.addHandler(handler)
+
+
+async def set_bot_commands(bot: Bot) -> None:
+    """Register bot commands for menu suggestions."""
+    user_commands = [
+        BotCommand(command="start", description="Khởi động bot / Trang chủ"),
+        BotCommand(command="help", description="Hướng dẫn sử dụng"),
+        BotCommand(command="mygoi", description="Xem gói dịch vụ của tôi"),
+        BotCommand(command="giahan", description="Gia hạn gói dịch vụ"),
+    ]
+    admin_commands = user_commands + [
+        BotCommand(command="admin", description="Bảng quản trị admin"),
+        BotCommand(command="baocao", description="Xem báo cáo doanh thu"),
+    ]
+
+    # Set default commands for all users
+    await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+
+    # Set extended commands for each admin
+    for admin_id in settings.admin_id_list:
+        try:
+            await bot.set_my_commands(
+                admin_commands,
+                scope=BotCommandScopeChat(chat_id=admin_id),
+            )
+        except Exception:
+            pass  # admin may not have started the bot yet
 
 
 async def main() -> None:
@@ -53,6 +81,7 @@ async def main() -> None:
 
     logger.info("bot started (long polling)")
     try:
+        await set_bot_commands(bot)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         scheduler.shutdown(wait=False)

@@ -2,16 +2,16 @@
 Report generation utilities.
 
 generate_report(period, session) → HTML string
-  period: 'daily' | 'weekly'
+  period: 'daily' | 'weekly' | 'monthly'
 """
 from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import PLANS
 from app.models.order import Order
 from app.models.subscription import Subscription
+from app.utils.plan_loader import get_plan
 
 
 def _day_start(now: datetime) -> datetime:
@@ -26,12 +26,17 @@ def _week_start(now: datetime) -> datetime:
     )
 
 
+def _month_start(now: datetime) -> datetime:
+    """First day of current month 00:00:00 UTC."""
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
 async def generate_report(period: str, session: AsyncSession) -> str:
     """
     Build an HTML-formatted revenue report.
 
     Args:
-        period: 'daily' for today, 'weekly' for Mon–now.
+        period: 'daily' for today, 'weekly' for Mon–now, 'monthly' for this month.
         session: active AsyncSession.
 
     Returns:
@@ -42,6 +47,9 @@ async def generate_report(period: str, session: AsyncSession) -> str:
     if period == "weekly":
         since = _week_start(now)
         label = f"Tuần này ({since.strftime('%d/%m')} — {now.strftime('%d/%m/%Y')})"
+    elif period == "monthly":
+        since = _month_start(now)
+        label = f"Tháng {now.month}/{now.year} ({since.strftime('%d/%m')} — {now.strftime('%d/%m/%Y')})"
     else:  # daily
         since = _day_start(now)
         label = f"Hôm nay ({now.strftime('%d/%m/%Y')})"
@@ -73,9 +81,9 @@ async def generate_report(period: str, session: AsyncSession) -> str:
         .where(Order.created_at >= since)
     )).scalar() or 0
 
-    # --- Active members right now ---
+    # --- Active members right now (distinct users) ---
     active_count = (await session.execute(
-        select(func.count(Subscription.id))
+        select(func.count(func.distinct(Subscription.user_id)))
         .where(Subscription.is_active.is_(True))
         .where(Subscription.expires_at > now)
     )).scalar() or 0
@@ -93,7 +101,7 @@ async def generate_report(period: str, session: AsyncSession) -> str:
     if paid_rows:
         lines.append("\n<b>Chi tiết theo gói:</b>")
         for plan_code, count, revenue in paid_rows:
-            plan = PLANS.get(plan_code, {})
+            plan = await get_plan(session, plan_code) or {}
             emoji = plan.get("emoji", "🎫")
             name = plan.get("name", plan_code)
             lines.append(

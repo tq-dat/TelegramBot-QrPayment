@@ -1,7 +1,8 @@
 import logging
 
 from aiogram import Router, F
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, CallbackQuery
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,8 +15,9 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 
-@router.message(Command("start"))
-async def cmd_start(message: Message, session: AsyncSession) -> None:
+@router.message(Command("start"), StateFilter("*"))
+async def cmd_start(message: Message, session: AsyncSession, state: FSMContext) -> None:
+    await state.clear()
     user = await get_or_create_user(message.from_user, session)
 
     if user.is_banned:
@@ -29,8 +31,9 @@ async def cmd_start(message: Message, session: AsyncSession) -> None:
     )
 
 
-@router.message(Command("help"))
-async def cmd_help(message: Message) -> None:
+@router.message(Command("help"), StateFilter("*"))
+async def cmd_help(message: Message, state: FSMContext) -> None:
+    await state.clear()
     await message.answer(Msg.HELP)
 
 

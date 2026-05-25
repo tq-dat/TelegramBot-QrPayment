@@ -3,7 +3,8 @@ from datetime import datetime, timezone
 
 from aiogram import Router, F
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, CallbackQuery
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -11,7 +12,7 @@ from sqlalchemy import select
 from app.messages.templates import Msg
 from app.keyboards.menus import main_menu_kb
 from app.models.subscription import Subscription
-from app.config import PLANS
+from app.utils.plan_loader import get_plan
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -35,7 +36,7 @@ async def _render_plan_status(user_id: int, session: AsyncSession) -> str:
     if sub is None:
         return Msg.NO_PLAN
 
-    plan = PLANS.get(sub.plan_code, {})
+    plan = await get_plan(session, sub.plan_code) or {}
     now = datetime.now(timezone.utc)
     days_left = max(0, (sub.expires_at - now).days)
     return Msg.PLAN_STATUS.format(
@@ -46,8 +47,9 @@ async def _render_plan_status(user_id: int, session: AsyncSession) -> str:
     )
 
 
-@router.message(Command("mygoi"))
-async def cmd_mygoi(message: Message, session: AsyncSession) -> None:
+@router.message(Command("mygoi"), StateFilter("*"))
+async def cmd_mygoi(message: Message, session: AsyncSession, state: FSMContext) -> None:
+    await state.clear()
     text = await _render_plan_status(message.from_user.id, session)
     await message.answer(text, reply_markup=main_menu_kb())
 

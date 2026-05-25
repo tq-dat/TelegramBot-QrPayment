@@ -14,10 +14,11 @@ from urllib.parse import quote_plus
 import httpx
 from sqlalchemy import select
 
-from app.config import settings, PLANS
+from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models.order import Order
 from app.models.subscription import Subscription
+from app.utils.plan_loader import get_plan
 from app.utils.invite import create_single_use_invite
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,30 @@ def _to_int(value: Any) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
+# Admin notification
+# ---------------------------------------------------------------------------
+
+async def _notify_admins_new_order(bot, order: Order, username: str | None) -> None:
+    """Send a new-order alert to all configured admin IDs."""
+    async with AsyncSessionLocal() as _s:
+        plan = await get_plan(_s, order.plan_code) or {}
+    name_str = f"@{username}" if username else f"id:{order.user_id}"
+    text = (
+        "🔔 <b>Đơn hàng mới / New order</b>\n\n"
+        f"👤 User: {name_str} (<code>{order.user_id}</code>)\n"
+        f"{plan.get('emoji','')} Gói / Plan: <b>{plan.get('name', order.plan_code)}</b>\n"
+        f"💰 Số tiền: <b>{order.amount:,}đ</b>\n"
+        f"🔖 Mã đơn: <code>{order.order_code}</code>\n"
+        f"📝 Nội dung CK: <code>{order.transfer_description}</code>"
+    )
+    for admin_id in settings.admin_id_list:
+        try:
+            await bot.send_message(admin_id, text, parse_mode="HTML")
+        except Exception as exc:
+            logger.warning("admin alert failed", extra={"admin_id": admin_id, "error": str(exc)})
+
+
+# ---------------------------------------------------------------------------
 # Sieuthicode API
 # ---------------------------------------------------------------------------
 
@@ -104,7 +129,7 @@ def snapshot_ids(transactions: list[dict[str, Any]]) -> set[str]:
 def find_match(
     transactions: list[dict[str, Any]],
     *,
-    memo: str,
+    order_code: str,
     amount: int,
     baseline_ids: set[str],
 ) -> Optional[dict[str, Any]]:
@@ -113,9 +138,9 @@ def find_match(
     - is NOT in baseline (i.e. new since we started watching)
     - has type == "IN"
     - has amount matching the order amount
-    - has description containing at least one memo candidate
+    - has description containing the order_code (unique per order)
     """
-    candidates = _memo_candidates(memo)
+    order_code_lower = order_code.lower()
     for tx in transactions:
         tx_id = str(tx.get("transactionID", "")).strip()
         if tx_id and tx_id in baseline_ids:
@@ -126,9 +151,7 @@ def find_match(
         if tx_type and tx_type != "in":
             continue
         desc_raw = str(tx.get("description", "") or "")
-        desc_strict = _collapse(_normalize_text(desc_raw))
-        desc_loose = _to_loose(desc_raw)
-        if any(c in desc_strict or c in desc_loose for c in candidates):
+        if order_code_lower in desc_raw.lower():
             return tx
     return None
 
@@ -163,9 +186,9 @@ async def generate_vietqr_image(amount: int, memo: str) -> bytes:
 
 async def activate_subscription(order: Order, session) -> Subscription:
     """
-    Mark the order as paid and create a Subscription.
-    If the user already has an active subscription, the new one is stacked
-    on top (starts when the current one expires).
+    Mark the order as paid and extend/create a Subscription.
+    If the user already has an active subscription, extends expires_at in-place (no new row).
+    Otherwise creates a new row.
     """
     now = datetime.now(timezone.utc)
     result = await session.execute(
@@ -178,32 +201,49 @@ async def activate_subscription(order: Order, session) -> Subscription:
     )
     current_sub = result.scalar_one_or_none()
 
-    plan = PLANS[order.plan_code]
-    started_at = current_sub.expires_at if current_sub else now
-    expires_at = started_at + timedelta(days=plan["days"])
+    plan = await get_plan(session, order.plan_code)
+    if not plan:
+        raise ValueError(f"Plan not found: {order.plan_code}")
 
-    sub = Subscription(
-        user_id=order.user_id,
-        plan_code=order.plan_code,
-        started_at=started_at,
-        expires_at=expires_at,
-        is_active=True,
-        order_id=order.id,
-    )
-    session.add(sub)
+    if current_sub:
+        # Extend existing subscription in-place — no new row
+        old_expires = current_sub.expires_at
+        current_sub.expires_at = current_sub.expires_at + timedelta(days=plan["days"])
+        current_sub.plan_code = order.plan_code
+        sub = current_sub
+        logger.info(
+            "subscription extended",
+            extra={
+                "user_id": order.user_id,
+                "order_code": order.order_code,
+                "plan": order.plan_code,
+                "old_expires_at": old_expires.isoformat(),
+                "new_expires_at": sub.expires_at.isoformat(),
+            },
+        )
+    else:
+        # No active sub — create a new row
+        sub = Subscription(
+            user_id=order.user_id,
+            plan_code=order.plan_code,
+            started_at=now,
+            expires_at=now + timedelta(days=plan["days"]),
+            is_active=True,
+            order_id=order.id,
+        )
+        session.add(sub)
+        logger.info(
+            "subscription created",
+            extra={
+                "user_id": order.user_id,
+                "order_code": order.order_code,
+                "plan": order.plan_code,
+                "expires_at": sub.expires_at.isoformat(),
+            },
+        )
+
     order.status = "paid"
     order.paid_at = now
-
-    logger.info(
-        "subscription activated",
-        extra={
-            "user_id": order.user_id,
-            "order_code": order.order_code,
-            "plan": order.plan_code,
-            "expires_at": expires_at.isoformat(),
-            "stacked_on": current_sub.expires_at.isoformat() if current_sub else None,
-        },
-    )
     return sub
 
 
@@ -214,8 +254,8 @@ async def activate_subscription(order: Order, session) -> Subscription:
 async def monitor_payment(
     *,
     order_id: int,
+    order_code: str,
     user_id: int,
-    memo: str,
     amount: int,
     bot,
     watch_seconds: int,
@@ -225,8 +265,8 @@ async def monitor_payment(
     Runs as an asyncio Task. Polls sieuthicode every poll_interval seconds
     until a matching transaction is found or watch_seconds elapses.
 
-    memo and amount are passed directly to avoid reading DB before
-    the creating session is committed.
+    order_code is used as the unique match key in transaction descriptions.
+    amount is a secondary guard against amount mismatches.
     """
     deadline = datetime.now(timezone.utc) + timedelta(seconds=watch_seconds)
 
@@ -262,7 +302,7 @@ async def monitor_payment(
 
         matched = find_match(
             transactions,
-            memo=memo,
+            order_code=order_code,
             amount=amount,
             baseline_ids=baseline_ids,
         )
@@ -282,7 +322,7 @@ async def monitor_payment(
 
                     await session.commit()
 
-                    plan = PLANS.get(order.plan_code, {})
+                    plan = await get_plan(session, order.plan_code) or {}
                     success_text = (
                         "✅ <b>Thanh toán thành công! / Payment successful!</b>\n\n"
                         f"{plan.get('emoji', '🎫')} Gói / Plan: <b>{plan.get('name', order.plan_code)}</b>\n"
@@ -302,6 +342,7 @@ async def monitor_payment(
                         )
 
                     await bot.send_message(user_id, success_text, parse_mode="HTML")
+
                     logger.info(
                         "payment confirmed",
                         extra={
