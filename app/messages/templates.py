@@ -100,3 +100,29 @@ class Msg:
         "⚠️ Đã xảy ra lỗi. Vui lòng thử lại.\n"
         "<i>An error occurred. Please try again.</i>"
     )
+
+    # ------------------------------------------------------------------
+    # Group welcome (posted in group when user joins)
+    # ------------------------------------------------------------------
+    GROUP_WELCOME_SHORT = (
+        "👋 <b>{name}</b> vừa vào.\n"
+        "Check DM từ bot — có hướng dẫn cho bạn."
+    )
+
+    # ------------------------------------------------------------------
+    # DM welcome after joining group
+    # ------------------------------------------------------------------
+    GROUP_WELCOME_DM = (
+        "— welcome —\n\n"
+        "🔥 <b>RAW</b>\n"
+        "<i>EDM · Club · Hard Dance · Hardwave</i>\n"
+        "Năng lượng, màu sắc mạnh, sung căng tươi.\n"
+        "Dành cho các DJ đang chiến tại bar sàn club — 9life.\n\n"
+        "🌑 <b>MINIMAL</b>\n"
+        "<i>Minimal · Ambient · Deep · Experimental</i>\n"
+        "Tối giản. Nhiều cảm xúc hơn.\n"
+        "Dành cho người chơi nhạc, sưu tầm nhạc, và những ai nghe bằng tai trong.\n\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "Chọn vibe của bạn và vào đúng topic.\n"
+        "Không có rule nào khác."
+    )

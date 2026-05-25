@@ -597,14 +597,14 @@ async def cb_adm_back(callback: CallbackQuery) -> None:
 # Test: manually trigger auto-kick (admin only)
 # ---------------------------------------------------------------------------
 
-# @router.message(Command("testkick"), StateFilter("*"))
-# async def cmd_testkick(message: Message, state: FSMContext) -> None:
-#     await state.clear()
-#     if not await _guard(message):
-#         return
-#     await message.answer("⏳ Đang chạy auto-kick thủ công...")
-#     await _kick_expired_users(message.bot)
-#     await message.answer("✅ Hoàn tất. Kiểm tra log để xem kết quả.")
+@router.message(Command("testkick"), StateFilter("*"))
+async def cmd_testkick(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    if not await _guard(message):
+        return
+    await message.answer("⏳ Đang chạy auto-kick thủ công...")
+    await _kick_expired_users(message.bot)
+    await message.answer("✅ Hoàn tất. Kiểm tra log để xem kết quả.")
 
 
 # ---------------------------------------------------------------------------

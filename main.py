@@ -12,6 +12,7 @@ from app.config import settings
 from app.middleware import DbSessionMiddleware
 from app.handlers import start, membership, renewal
 from app.handlers import admin as admin_handler
+from app.handlers import group_events as group_events_handler
 from app.scheduler import create_scheduler
 
 
@@ -73,6 +74,7 @@ async def main() -> None:
     dp.include_router(membership.router)
     dp.include_router(renewal.router)
     dp.include_router(admin_handler.router)
+    dp.include_router(group_events_handler.router)
 
     # Scheduler (D-3/D-1 reminders + auto-kick)
     scheduler = create_scheduler(bot)
