@@ -205,7 +205,8 @@ async def cb_adm_confirm_start(callback: CallbackQuery, state: FSMContext) -> No
     await callback.message.answer(
         "✅ <b>Confirm đơn thủ công</b>\n\n"
         "Nhập: <code>order_code</code>\n"
-        "Ví dụ: <code>VIPA1B2C3D4</code>",
+        "Ví dụ: <code>VIPA1B2C3D4</code>\n\n"
+        "<i>Áp dụng cho đơn pending hoặc expired (khách chuyển tiền muộn).</i>",
         reply_markup=admin_cancel_kb(),
         parse_mode="HTML",
     )
@@ -236,7 +237,8 @@ async def fsm_confirm_order(message: Message, state: FSMContext) -> None:
         if not order:
             await message.answer(f"❌ Không tìm thấy đơn <code>{order_code}</code>.", parse_mode="HTML")
             return
-        if order.status != "pending":
+        # expired = user paid late (monitor timed out), admin can still confirm
+        if order.status not in ("pending", "expired"):
             await message.answer(
                 f"⚠️ Đơn <code>{order_code}</code> có trạng thái <b>{order.status}</b>, không thể confirm.",
                 parse_mode="HTML",
