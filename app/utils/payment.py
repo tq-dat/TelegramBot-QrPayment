@@ -2,7 +2,7 @@
 Payment utilities:
 - VietQR image generation via vietqr.io
 - Transaction matching (ported from qr_example.py)
-- Async background payment monitor
+- Periodic payment check job (check_payments) + shared order confirmation
 """
 import asyncio
 import logging
@@ -10,16 +10,20 @@ import unicodedata
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 from urllib.parse import quote_plus
+from zoneinfo import ZoneInfo
 
 import httpx
-from sqlalchemy import select
+import resvg_py
+from sqlalchemy import select, update
 
 from app.config import settings
 from app.database import AsyncSessionLocal
+from app.models.audit_log import AuditLog
 from app.models.order import Order
 from app.models.subscription import Subscription
 from app.utils.plan_loader import get_plan
 from app.utils.invite import create_single_use_invite
+from app.utils.order import safe_html
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +99,10 @@ async def _notify_admins_new_order(bot, order: Order, username: str | None) -> N
         f"🔖 Mã đơn: <code>{order.order_code}</code>\n"
         f"📝 Nội dung CK: <code>{order.transfer_description}</code>"
     )
+    await _send_to_admins(bot, text)
+
+
+async def _send_to_admins(bot, text: str) -> None:
     for admin_id in settings.admin_id_list:
         try:
             await bot.send_message(admin_id, text, parse_mode="HTML")
@@ -114,16 +122,11 @@ async def fetch_transactions() -> list[dict[str, Any]]:
             headers={"Cookie": settings.SIEUTHICODE_COOKIE},
         )
         resp.raise_for_status()
-    return resp.json().get("transactions", [])
-
-
-def snapshot_ids(transactions: list[dict[str, Any]]) -> set[str]:
-    """Return the set of transactionID strings present in a transaction list."""
-    return {
-        str(tx.get("transactionID", "")).strip()
-        for tx in transactions
-        if tx.get("transactionID")
-    }
+    data = resp.json()
+    # An expired cookie still answers 200, so trust only an explicit success payload.
+    if data.get("status") != "success" or "transactions" not in data:
+        raise RuntimeError(f"sieuthicode error: {str(data.get('message') or data)[:200]}")
+    return data["transactions"]
 
 
 def find_match(
@@ -131,11 +134,11 @@ def find_match(
     *,
     order_code: str,
     amount: int,
-    baseline_ids: set[str],
+    used_ids: set[str],
 ) -> Optional[dict[str, Any]]:
     """
     Find the first transaction that:
-    - is NOT in baseline (i.e. new since we started watching)
+    - has not already paid another order (not in used_ids)
     - has type == "IN"
     - has amount matching the order amount
     - has description containing the order_code (unique per order)
@@ -143,7 +146,7 @@ def find_match(
     order_code_lower = order_code.lower()
     for tx in transactions:
         tx_id = str(tx.get("transactionID", "")).strip()
-        if tx_id and tx_id in baseline_ids:
+        if tx_id and tx_id in used_ids:
             continue
         if _to_int(tx.get("amount")) != amount:
             continue
@@ -163,7 +166,7 @@ def find_match(
 async def generate_vietqr_image(amount: int, memo: str) -> bytes:
     """
     Download a VietQR payment QR image from vietqr.io.
-    Returns raw image bytes (JPEG).
+    Returns raster image bytes (PNG when vietqr.io serves SVG).
     """
     url = settings.VIETQR_IMAGE_TEMPLATE.format(
         bank_id=settings.SIEUTHICODE_BANK_ID,
@@ -174,9 +177,18 @@ async def generate_vietqr_image(amount: int, memo: str) -> bytes:
         f"&addInfo={quote_plus(memo)}"
         f"&accountName={quote_plus(settings.BANK_ACCOUNT_NAME)}"
     )
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         resp = await client.get(f"{url}?{query}")
         resp.raise_for_status()
+    # Since ~2026-10 img.vietqr.io redirects .jpg/.png to .svg; Telegram photos need a raster image.
+    if "svg" in resp.headers.get("content-type", ""):
+        return await asyncio.to_thread(
+            resvg_py.svg_to_bytes,
+            svg_string=resp.text,
+            zoom=2,
+            # SVG hardcodes Arial; Linux servers usually only have DejaVu (apt: fonts-dejavu-core).
+            style_sheet='text{font-family:Arial,"DejaVu Sans",sans-serif}',
+        )
     return resp.content
 
 
@@ -248,127 +260,202 @@ async def activate_subscription(order: Order, session) -> Subscription:
 
 
 # ---------------------------------------------------------------------------
-# Async background payment monitor
+# Order confirmation (shared by the payment job and admin "Confirm đơn")
 # ---------------------------------------------------------------------------
 
-async def monitor_payment(
-    *,
-    order_id: int,
-    order_code: str,
-    user_id: int,
-    amount: int,
+# A user may pay an old QR after switching plan (cancelled) or after it lapsed (expired).
+CONFIRMABLE_STATUSES = ("pending", "cancelled", "expired")
+
+
+async def confirm_order_payment(
     bot,
-    watch_seconds: int,
-    poll_interval: int,
-) -> None:
+    order_code: str,
+    *,
+    transaction_id: str | None = None,
+    admin_id: int | None = None,
+) -> tuple[Optional[Order], Optional[Subscription], Optional[str], Optional[str]]:
     """
-    Runs as an asyncio Task. Polls sieuthicode every poll_interval seconds
-    until a matching transaction is found or watch_seconds elapses.
+    Activate an order exactly once and create its invite link.
+    The row lock serializes the payment job and an admin confirming concurrently:
+    whoever comes second sees status 'paid' and gets sub=None.
 
-    order_code is used as the unique match key in transaction descriptions.
-    amount is a secondary guard against amount mismatches.
+    Returns (order, sub, invite_link, invite_err). sub is None when the order
+    does not exist or is not in a confirmable status.
     """
-    deadline = datetime.now(timezone.utc) + timedelta(seconds=watch_seconds)
+    async with AsyncSessionLocal() as session:
+        order = (await session.execute(
+            select(Order).where(Order.order_code == order_code).with_for_update()
+        )).scalar_one_or_none()
+        if not order or order.status not in CONFIRMABLE_STATUSES:
+            return order, None, None, None
 
-    # Snapshot current transactions so we only look at NEW ones
-    baseline_ids: set[str] = set()
-    try:
-        baseline_ids = snapshot_ids(await fetch_transactions())
-        logger.info(
-            "payment monitor started",
-            extra={"order_id": order_id, "baseline_count": len(baseline_ids)},
-        )
-    except Exception as exc:
-        logger.warning("baseline snapshot failed", extra={"error": str(exc)})
+        sub = await activate_subscription(order, session)
+        if transaction_id:
+            order.transaction_id = transaction_id
+        invite_link, invite_err = await create_single_use_invite(bot, order.order_code)
+        if invite_link:
+            order.invite_link = invite_link
+        if admin_id:
+            session.add(AuditLog(
+                admin_id=admin_id,
+                action="confirm_order",
+                target_user_id=order.user_id,
+                detail={"order_code": order_code},
+            ))
+        await session.commit()
+    return order, sub, invite_link, invite_err
 
-    while datetime.now(timezone.utc) < deadline:
-        await asyncio.sleep(poll_interval)
 
-        # Stop if the order has been cancelled or already paid externally
-        async with AsyncSessionLocal() as session:
-            order = await session.get(Order, order_id)
-            if not order or order.status != "pending":
-                logger.info(
-                    "monitor stopping: status changed",
-                    extra={"order_id": order_id, "status": getattr(order, "status", None)},
-                )
-                return
+# ---------------------------------------------------------------------------
+# Periodic payment check — APScheduler job "check_payments" (app/scheduler.py)
+# ---------------------------------------------------------------------------
 
+API_ALERT_AFTER = timedelta(minutes=3)
+# Orders that lapsed longer ago than this (backlog after downtime/deploy) expire without a DM.
+EXPIRY_NOTIFY_WINDOW = timedelta(hours=1)
+
+_api_failing_since: Optional[datetime] = None
+_api_alert_sent = False
+
+
+def match_orders(
+    orders: list[Order],
+    transactions: list[dict[str, Any]],
+    used_ids: set[str],
+) -> list[tuple[Order, dict[str, Any]]]:
+    """Pair each order with the first unused incoming transaction that pays it."""
+    used = set(used_ids)
+    matches = []
+    for order in orders:
+        tx = find_match(transactions, order_code=order.order_code, amount=order.amount, used_ids=used)
+        if tx:
+            used.add(str(tx.get("transactionID", "")).strip())
+            matches.append((order, tx))
+    return matches
+
+
+async def check_payments(bot) -> None:
+    """
+    Runs every PAYMENT_POLL_INTERVAL_SECONDS. One sieuthicode call covers every
+    open order, so payments are caught regardless of QR success, restarts, or
+    how late (within ORDER_EXPIRY_HOURS) the user pays.
+    """
+    now = datetime.now(timezone.utc)
+    async with AsyncSessionLocal() as session:
+        open_orders = list((await session.execute(
+            select(Order)
+            .where(Order.status.in_(CONFIRMABLE_STATUSES))
+            .where(Order.expires_at > now)
+        )).scalars().all())
+
+    # shortcut: API health is only probed while orders are open, so a dead cookie surfaces on the next order; add an idle probe if that is too late.
+    if open_orders:
         try:
             transactions = await fetch_transactions()
         except Exception as exc:
-            logger.warning("poll error", extra={"order_id": order_id, "error": str(exc)})
-            continue
+            await _api_failed(bot, now, exc)
+        else:
+            await _api_recovered(bot)
+            tx_ids = [str(t["transactionID"]).strip() for t in transactions if t.get("transactionID")]
+            async with AsyncSessionLocal() as session:
+                used = set((await session.execute(
+                    select(Order.transaction_id).where(Order.transaction_id.in_(tx_ids))
+                )).scalars().all())
+            for order, tx in match_orders(open_orders, transactions, used):
+                try:
+                    await _confirm_and_notify(bot, order.order_code, tx)
+                except Exception:
+                    logger.exception("auto confirm failed", extra={"order_code": order.order_code})
 
-        matched = find_match(
-            transactions,
-            order_code=order_code,
-            amount=amount,
-            baseline_ids=baseline_ids,
+    await _expire_overdue_orders(bot, now)
+
+
+async def _confirm_and_notify(bot, order_code: str, tx: dict[str, Any]) -> None:
+    tx_id = str(tx.get("transactionID", "")).strip() or None
+    order, sub, invite_link, invite_err = await confirm_order_payment(
+        bot, order_code, transaction_id=tx_id
+    )
+    if not sub:
+        return  # confirmed by an admin in the meantime
+
+    async with AsyncSessionLocal() as session:
+        plan = await get_plan(session, order.plan_code) or {}
+    ttl_min = settings.INVITE_LINK_TTL_SECONDS // 60
+    text = (
+        "✅ <b>Thanh toán thành công! / Payment successful!</b>\n\n"
+        f"🔖 Mã đơn / Order: <code>{order.order_code}</code>\n"
+        f"{plan.get('emoji', '🎫')} Gói / Plan: <b>{plan.get('name', order.plan_code)}</b>\n"
+        f"📅 Hết hạn / Expires: <b>{sub.expires_at.strftime('%d/%m/%Y')}</b>\n\n"
+    )
+    if invite_link:
+        text += (
+            f"🔗 <b>Link vào nhóm (1 lần dùng, hết hạn sau {ttl_min} phút):</b>\n"
+            f"{invite_link}\n\n"
+            f"<i>One-time link, expires in {ttl_min} minutes.</i>"
+        )
+    else:
+        text += (
+            f"⚠️ Không tạo được link mời: {safe_html(invite_err)}\n"
+            "<i>Could not generate invite link. Contact admin.</i>"
+        )
+    logger.info(
+        "payment confirmed",
+        extra={"order_code": order.order_code, "transaction_id": tx_id, "invite_link_ok": invite_link is not None},
+    )
+    await bot.send_message(order.user_id, text, parse_mode="HTML")
+
+
+async def _expire_overdue_orders(bot, now: datetime) -> None:
+    async with AsyncSessionLocal() as session:
+        # Conditional UPDATE so an order an admin confirms concurrently is never flipped back.
+        rows = (await session.execute(
+            update(Order)
+            .where(Order.status == "pending")
+            .where(Order.expires_at <= now)
+            .values(status="expired")
+            .returning(Order.order_code, Order.user_id, Order.expires_at)
+        )).all()
+        await session.commit()
+
+    for order_code, user_id, expires_at in rows:
+        logger.info("order expired", extra={"order_code": order_code, "user_id": user_id})
+        if now - expires_at > EXPIRY_NOTIFY_WINDOW:
+            continue
+        try:
+            await bot.send_message(
+                user_id,
+                (
+                    f"⏰ <b>Đơn <code>{order_code}</code> đã hết hạn thanh toán.</b>\n"
+                    f"<i>Order <code>{order_code}</code> has expired.</i>\n\n"
+                    "Dùng /giahan để tạo đơn hàng mới. Nếu bạn đã chuyển khoản, hãy liên hệ admin.\n"
+                    "<i>Use /giahan to create a new order. If you already paid, contact the admin.</i>"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            logger.warning("expiry notification failed", extra={"user_id": user_id, "error": str(exc)})
+
+
+async def _api_failed(bot, now: datetime, exc: Exception) -> None:
+    global _api_failing_since, _api_alert_sent
+    logger.warning("sieuthicode fetch failed", extra={"error": str(exc)})
+    if _api_failing_since is None:
+        _api_failing_since = now
+    if not _api_alert_sent and now - _api_failing_since >= API_ALERT_AFTER:
+        _api_alert_sent = True
+        local_time = _api_failing_since.astimezone(ZoneInfo(settings.TIMEZONE))
+        await _send_to_admins(
+            bot,
+            "🚨 <b>Bot không kiểm tra được thanh toán!</b>\n\n"
+            f"sieuthicode lỗi liên tục từ {local_time.strftime('%H:%M %d/%m')}.\n"
+            f"Lỗi: <code>{safe_html(str(exc)[:200])}</code>\n\n"
+            "Kiểm tra <code>SIEUTHICODE_COOKIE</code>. Trong lúc này dùng /admin → Confirm đơn.",
         )
 
-        if matched:
-            async with AsyncSessionLocal() as session:
-                order = await session.get(Order, order_id)
-                if order and order.status == "pending":
-                    sub = await activate_subscription(order, session)
 
-                    # Generate single-use group invite link (1 use, 5 min TTL)
-                    invite_link, invite_err = await create_single_use_invite(
-                        bot, order.order_code
-                    )
-                    if invite_link:
-                        order.invite_link = invite_link
-
-                    await session.commit()
-
-                    plan = await get_plan(session, order.plan_code) or {}
-                    success_text = (
-                        "✅ <b>Thanh toán thành công! / Payment successful!</b>\n\n"
-                        f"{plan.get('emoji', '🎫')} Gói / Plan: <b>{plan.get('name', order.plan_code)}</b>\n"
-                        f"📅 Hết hạn / Expires: <b>{sub.expires_at.strftime('%d/%m/%Y')}</b>\n\n"
-                    )
-                    if invite_link:
-                        success_text += (
-                            "🔗 <b>Link vào nhóm (1 lần dùng, hết hạn sau 5 phút):</b>\n"
-                            f"{invite_link}\n\n"
-                            "<i>⚠️ Link chỉ dùng được 1 lần và hết hạn sau 5 phút.</i>\n"
-                            "<i>One-time link, expires in 5 minutes.</i>"
-                        )
-                    else:
-                        success_text += (
-                            f"⚠️ Không tạo được link mời: {invite_err}\n"
-                            "<i>Could not generate invite link. Contact admin.</i>"
-                        )
-
-                    await bot.send_message(user_id, success_text, parse_mode="HTML")
-
-                    logger.info(
-                        "payment confirmed",
-                        extra={
-                            "order_id": order_id,
-                            "transaction_id": matched.get("transactionID"),
-                            "invite_link_ok": invite_link is not None,
-                        },
-                    )
-            return
-
-    # Deadline reached — mark order as expired
-    async with AsyncSessionLocal() as session:
-        order = await session.get(Order, order_id)
-        if order and order.status == "pending":
-            order.status = "expired"
-            await session.commit()
-            logger.info("order expired by monitor", extra={"order_id": order_id})
-
-    minutes = watch_seconds // 60
-    await bot.send_message(
-        user_id,
-        (
-            f"⏰ <b>Đã hết {minutes} phút chờ thanh toán.</b>\n"
-            "<i>Payment window expired.</i>\n\n"
-            "Dùng /giahan để tạo đơn hàng mới.\n"
-            "<i>Use /giahan to create a new order.</i>"
-        ),
-        parse_mode="HTML",
-    )
+async def _api_recovered(bot) -> None:
+    global _api_failing_since, _api_alert_sent
+    if _api_alert_sent:
+        await _send_to_admins(bot, "✅ <b>sieuthicode hoạt động lại</b>, bot tiếp tục tự xác nhận thanh toán.")
+    _api_failing_since = None
+    _api_alert_sent = False

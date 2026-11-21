@@ -36,8 +36,7 @@ class Settings(BaseSettings):
     SIEUTHICODE_BANK_ID: str = ""
     VIETQR_IMAGE_TEMPLATE: str = "https://img.vietqr.io/image/{bank_id}-{account_no}-compact2.jpg"
 
-    # Payment monitoring
-    PAYMENT_WATCH_SECONDS: int = 300   # 5 minutes
+    # Payment monitoring — check_payments job interval; orders stay payable for ORDER_EXPIRY_HOURS
     PAYMENT_POLL_INTERVAL_SECONDS: int = 15
 
     # Group invite link after successful payment

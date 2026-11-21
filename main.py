@@ -14,6 +14,7 @@ from app.handlers import start, membership, renewal
 from app.handlers import admin as admin_handler
 from app.handlers import group_events as group_events_handler
 from app.scheduler import create_scheduler
+from app.utils.error_alert import AdminAlertHandler
 
 
 def setup_logging() -> None:
@@ -25,6 +26,8 @@ def setup_logging() -> None:
     root = logging.getLogger()
     root.setLevel(logging.DEBUG if settings.DEBUG else logging.INFO)
     root.addHandler(handler)
+    # check_payments runs every few seconds; per-run "Running job"/"executed" lines would flood journald.
+    logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
 
 
 async def set_bot_commands(bot: Bot) -> None:
@@ -64,6 +67,7 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
+    logging.getLogger().addHandler(AdminAlertHandler(bot, asyncio.get_running_loop()))
 
     # Middleware — inject DB session into every handler
     dp.message.middleware(DbSessionMiddleware())

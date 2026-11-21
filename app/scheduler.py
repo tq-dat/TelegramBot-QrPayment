@@ -15,6 +15,7 @@ from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models.subscription import Subscription
 from app.models.user import User
+from app.utils.payment import check_payments
 from app.utils.plan_loader import get_plan
 from app.utils.report import generate_report
 
@@ -213,10 +214,22 @@ def create_scheduler(bot) -> AsyncIOScheduler:
         misfire_grace_time=3600,
     )
 
+    # Payment detection — one sieuthicode call per run covers every open order
+    scheduler.add_job(
+        check_payments,
+        IntervalTrigger(seconds=settings.PAYMENT_POLL_INTERVAL_SECONDS, timezone=settings.TIMEZONE),
+        args=[bot],
+        id="check_payments",
+        replace_existing=True,
+        max_instances=1,   # a slow API call makes the next run skip, never overlap
+        coalesce=True,
+        misfire_grace_time=settings.PAYMENT_POLL_INTERVAL_SECONDS,
+    )
+
     # Auto-kick expired users — every 30 minutes
     scheduler.add_job(
         _kick_expired_users,
-        IntervalTrigger(minutes=30),
+        IntervalTrigger(minutes=30, timezone=settings.TIMEZONE),
         args=[bot],
         id="kick_expired",
         replace_existing=True,

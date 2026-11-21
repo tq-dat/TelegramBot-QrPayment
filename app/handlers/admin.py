@@ -31,8 +31,8 @@ from app.models.order import Order
 from app.models.plan import Plan
 from app.models.subscription import Subscription
 from app.models.user import User
-from app.utils.invite import create_single_use_invite
-from app.utils.payment import activate_subscription
+from app.utils.order import safe_html
+from app.utils.payment import confirm_order_payment
 from app.utils.plan_loader import get_plan, get_all_plans, slugify
 from app.utils.report import generate_report
 from app.scheduler import _kick_expired_users
@@ -206,7 +206,7 @@ async def cb_adm_confirm_start(callback: CallbackQuery, state: FSMContext) -> No
         "✅ <b>Confirm đơn thủ công</b>\n\n"
         "Nhập: <code>order_code</code>\n"
         "Ví dụ: <code>VIPA1B2C3D4</code>\n\n"
-        "<i>Áp dụng cho đơn pending hoặc expired (khách chuyển tiền muộn).</i>",
+        "<i>Áp dụng cho đơn pending, cancelled hoặc expired (khách chuyển tiền muộn).</i>",
         reply_markup=admin_cancel_kb(),
         parse_mode="HTML",
     )
@@ -228,38 +228,19 @@ async def fsm_confirm_order(message: Message, state: FSMContext) -> None:
 
     await state.clear()
 
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(Order).where(Order.order_code == order_code)
+    # Shared with the check_payments job; the row lock prevents double activation.
+    order, sub, invite_link, invite_err = await confirm_order_payment(
+        message.bot, order_code, admin_id=message.from_user.id
+    )
+    if not order:
+        await message.answer(f"❌ Không tìm thấy đơn <code>{safe_html(order_code)}</code>.", parse_mode="HTML")
+        return
+    if not sub:
+        await message.answer(
+            f"⚠️ Đơn <code>{order_code}</code> có trạng thái <b>{order.status}</b>, không thể confirm.",
+            parse_mode="HTML",
         )
-        order = result.scalar_one_or_none()
-
-        if not order:
-            await message.answer(f"❌ Không tìm thấy đơn <code>{order_code}</code>.", parse_mode="HTML")
-            return
-        # expired = user paid late (monitor timed out), admin can still confirm
-        if order.status not in ("pending", "expired"):
-            await message.answer(
-                f"⚠️ Đơn <code>{order_code}</code> có trạng thái <b>{order.status}</b>, không thể confirm.",
-                parse_mode="HTML",
-            )
-            return
-
-        sub = await activate_subscription(order, session)
-
-        # Generate invite link
-        invite_link, invite_err = await create_single_use_invite(message.bot, order_code)
-        if invite_link:
-            order.invite_link = invite_link
-
-        # Audit log
-        session.add(AuditLog(
-            admin_id=message.from_user.id,
-            action="confirm_order",
-            target_user_id=order.user_id,
-            detail={"order_code": order_code},
-        ))
-        await session.commit()
+        return
 
     # Notify user
     async with AsyncSessionLocal() as _s:

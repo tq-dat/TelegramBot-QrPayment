@@ -39,7 +39,7 @@ Tai lieu nay mo ta testcase cho pham vi MVP 3 ngay, tap trung vao luong user, pa
 | TC-020 | Auto monitor bo qua giao dich baseline | Co transaction cu truoc khi monitor start | 1) Bat dau monitor 2) Dua lai transaction cu | Khong match transaction cu, order van pending | P0 |
 | TC-021 | Auto match thanh cong voi memo + amount | Co transaction moi IN dung memo va dung amount | 1) Tao order 2) Day transaction hop le | Order thanh paid, tao subscription, user nhan thong bao thanh cong | P0 |
 | TC-022 | Khong match neu sai amount | Co transaction moi memo dung nhung amount sai | 1) Tao order 2) Day transaction sai amount | Order khong duoc paid | P0 |
-| TC-023 | Het thoi gian cho thanh toan | Khong co transaction hop le trong watch window | 1) Tao order 2) Cho het PAYMENT_WATCH_SECONDS | Order chuyen expired, user nhan thong bao het han thanh toan | P0 |
+| TC-023 | Het thoi gian cho thanh toan | Khong co transaction hop le trong ORDER_EXPIRY_HOURS | 1) Tao order 2) Cho qua expires_at (hoac sua expires_at trong DB) | Job check_payments chuyen order sang expired, user nhan thong bao het han; thanh toan muon trong 24h van duoc tu xac nhan | P0 |
 | TC-024 | Idempotency khi monitor gap transaction lap | 1 order pending, transaction bi fetch lap | 1) Day cung 1 transaction nhieu lan | Chi kich hoat subscription 1 lan, khong cong han lap | P0 |
 | TC-025 | Thanh toan thanh cong tao invite link | GROUP_ID hop le, bot co quyen tao invite | 1) Auto match thanh cong | User nhan invite link 1 lan, order luu invite_link | P1 |
 | TC-026 | Loi tao invite link van thong bao paid | GROUP_ID sai hoac bot thieu quyen | 1) Auto match thanh cong | User van nhan message paid kem canh bao khong tao duoc link | P1 |

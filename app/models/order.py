@@ -30,7 +30,7 @@ class Order(Base):
     # Nội dung chuyển khoản mà user cần ghi vào khi chuyển tiền
     transfer_description: Mapped[str] = mapped_column(String(255), nullable=False)
     # Transaction ID trả về từ bank (sau khi match thành công)
-    transaction_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    transaction_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, unique=True, index=True)
     note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # admin notes
     invite_link: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)  # single-use group invite
     created_at: Mapped[datetime] = mapped_column(
