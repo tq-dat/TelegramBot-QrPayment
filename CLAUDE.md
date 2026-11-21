@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Telegram bot (aiogram 3, long polling) selling time-limited VIP memberships to a private Telegram music group. Payment is bank transfer verified by polling a third-party bank-history API (sieuthicode); on match the bot extends the subscription and hands out a single-use group invite link. Admin surface is entirely inside Telegram. Python 3.12 + PostgreSQL 15, async throughout, no Docker (systemd on the VPS per `projectPlan/03-*.md`).
+Telegram bot (aiogram 3, long polling) selling time-limited VIP memberships to a private Telegram music group. Payment is bank transfer verified by polling a third-party bank-history API (sieuthicode); on match the bot extends the subscription and hands out a single-use group invite link. Admin surface is entirely inside Telegram. Python 3.12 + PostgreSQL (14 in production), async throughout, no Docker (systemd on the VPS per `projectPlan/03-*.md`).
 
 User-facing strings are bilingual Vietnamese/English HTML in `app/messages/templates.py`; admin strings are Vietnamese inline in `app/handlers/admin.py`.
 

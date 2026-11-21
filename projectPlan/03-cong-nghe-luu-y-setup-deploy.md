@@ -20,45 +20,177 @@
 6. Moi action quan tri can ghi audit log.
 7. Backup database truoc moi lan deploy.
 
-## 3) Cac buoc setup server Linux VPS (non-Docker)
-1. Chuan bi VPS Linux (khuyen nghi Ubuntu 22.04 LTS), cau hinh SSH key.
-2. Cap nhat he thong va cai goi can thiet: Python, venv, PostgreSQL, git, build dependencies.
-3. Tao user chay ung dung rieng, cap quyen thu muc project.
-4. Clone source code vao thu muc deploy.
-5. Tao virtual environment va cai dependencies tu requirements.
-6. Tao database PostgreSQL, user DB va cap quyen.
-7. Cau hinh bien moi truong production trong file env noi bo.
-8. Chay migration Alembic de tao schema.
-9. Tao systemd service cho bot chinh.
-10. Tao them service hoac timer cho scheduler dinh ky neu tach tien trinh.
-11. Bat auto-start service khi reboot va chay thu bang systemctl.
-12. Thiet lap logrotate hoac chinh sach quan ly journal de tranh day dia.
-13. Mo firewall dung cong can thiet; neu dung webhook thi cau hinh them domain va HTTPS reverse proxy.
-14. Neu uu tien trien khai nhanh trong 3 ngay, co the dung long polling de giam thoi gian setup ha tang HTTPS.
+## 3) Cai dat server tu dau (Ubuntu 22.04, non-Docker)
 
-## 4) Cac buoc deploy san pham len server
-1. Pre-deploy checklist: xac nhan backup DB, tag release, freeze dependency.
-2. Pull source version moi len server.
-3. Kich hoat venv va cai them dependency moi neu co.
-4. Chay migration database.
-5. Restart cac service systemd theo thu tu: API tich hop, bot worker, scheduler.
-6. Chay health check: service status, log loi, kiem tra ket noi DB.
-7. Smoke test nghiep vu chinh tren Telegram:
-- /start, /mygoi, /giahan.
-- Tao order va xac minh thanh toan.
-- Cap quyen user sau thanh toan.
-- Kiem tra lenh admin quan trong.
-8. Theo doi log sau deploy toi thieu 1 den 2 gio.
+Hien trang production (cap nhat 21/11/2026): Ubuntu 22.04, 1 vCPU, 1 GB RAM, Python 3.12 (PPA deadsnakes),
+PostgreSQL 14, user he thong `botuser` (home `/opt/telegrambot`), code tai `/opt/telegrambot/app-src`,
+service systemd `telegrambot`. Bot chay 1 tien trinh duy nhat: long polling + APScheduler
+(nhac han, kick, bao cao, va job `check_payments` xac nhan thanh toan). Khong can mo port, khong can HTTPS.
+
+Tat ca lenh duoi chay bang `root`.
+
+1. Goi he thong (font `fonts-dejavu-core` BAT BUOC: thieu font thi anh QR mat dong ten/STK/so tien):
+```bash
+apt update
+apt install -y software-properties-common git postgresql fonts-dejavu-core
+add-apt-repository -y ppa:deadsnakes/ppa
+apt install -y python3.12 python3.12-venv
+```
+2. User chay ung dung va source code:
+```bash
+useradd --system --create-home --home-dir /opt/telegrambot --shell /bin/bash botuser
+sudo -u botuser git clone https://github.com/tq-dat/TelegramBot-QrPayment.git /opt/telegrambot/app-src
+cd /opt/telegrambot/app-src
+sudo -u botuser python3.12 -m venv venv
+sudo -u botuser venv/bin/pip install -r requirements.txt
+```
+3. Database (doi `MAT_KHAU` thanh mat khau manh):
+```bash
+sudo -u postgres psql -c "CREATE USER botuser WITH PASSWORD 'MAT_KHAU';"
+sudo -u postgres psql -c "CREATE DATABASE telegrambot OWNER botuser;"
+```
+4. File cau hinh `.env` (khong commit, chi botuser doc duoc):
+```bash
+sudo -u botuser cp .env.example .env && chmod 600 .env
+sudo -u botuser nano .env
+```
+   - `BOT_TOKEN`, `ADMIN_IDS` (Telegram user ID, cach nhau dau phay), `GROUP_ID`.
+   - `DATABASE_URL=postgresql+asyncpg://botuser:MAT_KHAU@localhost:5432/telegrambot`
+   - `BANK_*`, `SIEUTHICODE_API_URL`, `SIEUTHICODE_COOKIE`, `SIEUTHICODE_BANK_ID`.
+   - `PAYMENT_POLL_INTERVAL_SECONDS=15` (chu ky job check_payments), `ORDER_EXPIRY_HOURS=24`
+     (don con duoc tu xac nhan trong bao lau).
+   - Moi admin trong `ADMIN_IDS` phai nhan /start cho bot 1 lan, neu khong bot khong nhan tin
+     canh bao loi va don moi duoc.
+5. Tao schema va kiem tra nhanh:
+```bash
+sudo -u botuser venv/bin/alembic upgrade head
+sudo -u botuser venv/bin/python -m tests.test_payment_match
+sudo -u botuser venv/bin/python -m tests.test_error_alert
+```
+6. Service systemd `/etc/systemd/system/telegrambot.service`:
+```ini
+[Unit]
+Description=Telegram VIP Music Bot (aiogram long polling + scheduler)
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/telegrambot/app-src
+ExecStart=/opt/telegrambot/app-src/venv/bin/python /opt/telegrambot/app-src/main.py
+Environment=PYTHONUNBUFFERED=1
+Environment=LANG=C.UTF-8
+Environment=LC_ALL=C.UTF-8
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/telegrambot
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=telegrambot
+
+[Install]
+WantedBy=multi-user.target
+```
+```bash
+systemctl daemon-reload
+systemctl enable --now telegrambot
+systemctl status telegrambot
+```
+7. Thu muc backup:
+```bash
+mkdir -p /opt/telegrambot/backups && chown botuser:botuser /opt/telegrambot/backups && chmod 700 /opt/telegrambot/backups
+```
+8. Luu y journal: mac dinh journald dung toi da ~10% dia cho TAT CA service; tren VPS 16 GB log
+   cua bot chi con giu ~6 tuan. Neu can giu lau hon, cau hinh `SystemMaxUse` / `MaxRetentionSec`
+   trong `/etc/systemd/journald.conf`.
+
+## 4) Cap nhat ban moi (update ve sau)
+
+Chay bang `root`. Thay `<nhanh>` bang nhanh can deploy (binh thuong la `main`).
+
+1. Truoc khi deploy:
+   - Doc commit / migration moi (`git log`, `alembic/versions/`).
+   - Kiem tra don dang cho: job `check_payments` se chuyen moi don `pending` qua `ORDER_EXPIRY_HOURS`
+     sang `expired` (khong nhan khach neu da qua han > 1 gio). Doi soat sao ke va "Confirm don" truoc
+     neu nghi khach da tra.
+```bash
+sudo -u postgres psql -d telegrambot -c "select order_code,status,amount,created_at from orders where status='pending' order by created_at;"
+```
+2. Backup DB:
+```bash
+cd /opt/telegrambot/app-src
+F=/opt/telegrambot/backups/telegrambot-$(date +%Y%m%d-%H%M)-pre-$(sudo -u botuser git rev-parse --short HEAD).sql.gz
+sudo -u postgres pg_dump telegrambot | gzip > $F && chown botuser:botuser $F && chmod 600 $F && ls -la $F
+```
+3. Lay code moi + dependency (bot cu van dang chay, chua anh huong):
+```bash
+sudo -u botuser git fetch origin
+sudo -u botuser git checkout <nhanh> && sudo -u botuser git pull --ff-only
+sudo -u botuser venv/bin/pip install -r requirements.txt
+```
+4. Kiem tra truoc khi restart (that bai thi DUNG, khong restart):
+```bash
+sudo -u botuser venv/bin/python -m tests.test_payment_match
+sudo -u botuser venv/bin/python -m tests.test_error_alert
+sudo -u botuser venv/bin/python -c "import main"
+```
+5. Migration + restart:
+```bash
+sudo -u botuser venv/bin/alembic upgrade head
+systemctl restart telegrambot
+sleep 30; systemctl is-active telegrambot
+```
+6. Kiem tra sau deploy:
+```bash
+# Log ke tu khi restart (thay gio cho dung)
+journalctl -u telegrambot --since "10 min ago" -o cat | grep -E '"levelname": "(ERROR|WARNING)"'
+# Job thanh toan co goi sieuthicode thanh cong khong (chi goi khi co don dang cho)
+journalctl -u telegrambot --since "10 min ago" -o cat | grep historyapi | grep -c "200 OK"
+```
+   - Luu y: log la JSON nen journald coi moi dong la muc info, `journalctl -p err` KHONG loc duoc;
+     phai grep `"levelname": "ERROR"`.
+   - Moi loi muc ERROR deu duoc bot nhan cho admin (toi da 1 lan / 30 phut moi loai loi).
+7. Smoke test tren Telegram: /start, /mygoi, /giahan -> chon goi -> nhan anh QR day du chu;
+   /admin -> "Don pending" thay don vua tao; huy don.
+8. Theo doi log va tin canh bao admin it nhat 1-2 gio.
 
 ## 5) Rollback khi co su co
-1. Dung service lien quan.
-2. Checkout lai ban release truoc.
-3. Khoi phuc DB tu backup gan nhat neu migration gay loi du lieu.
-4. Khoi dong lai service va chay smoke test toi thieu.
-5. Ghi bien ban su co de cap nhat checklist lan deploy sau.
+```bash
+systemctl stop telegrambot
+cd /opt/telegrambot/app-src
+# 1. Ha migration ve revision cua ban cu NEU ban moi co migration (vd 004 -> 003)
+sudo -u botuser venv/bin/alembic downgrade <revision_cu>
+# 2. Ve commit cu (xem lai trong ten file backup: ...-pre-<commit>.sql.gz)
+sudo -u botuser git checkout <commit_cu>
+sudo -u botuser venv/bin/pip install -r requirements.txt
+systemctl start telegrambot
+```
+- Chi khoi phuc DB tu backup khi migration lam hong du lieu (mat cac don/thanh toan phat sinh sau
+  thoi diem backup):
+```bash
+systemctl stop telegrambot
+sudo -u postgres dropdb telegrambot && sudo -u postgres createdb -O botuser telegrambot
+zcat /opt/telegrambot/backups/<file>.sql.gz | sudo -u postgres psql -d telegrambot
+systemctl start telegrambot
+```
+- Ghi bien ban su co de cap nhat checklist lan deploy sau.
+
+## 5b) Lich su deploy
+| Ngay | Commit | Noi dung | Ghi chu |
+|---|---|---|---|
+| 21/11/2026 | 4203f36 (nhanh `fix/payment-job`) | Job `check_payments` thay monitor tung don; render QR SVG->PNG; canh bao loi cho admin; migration 004 | Cai them `fonts-dejavu-core`. Backup: `telegrambot-20261121-1748-pre-4203f36.sql.gz`. 5 don pending cu (28/10-16/11) da tu chuyen `expired` khi khoi dong. Sau khi merge vao `main`, chuyen server ve `main`: `git checkout main && git pull --ff-only`. |
 
 ## 6) Checklist van hanh hang ngay
-1. Kiem tra so don moi, don loi match va hang doi manual review.
+1. Kiem tra so don moi, don loi match va hang doi manual review (/admin -> "Don pending").
 2. Kiem tra job nhac han va kick han co chay dung lich.
 3. Kiem tra dung luong log va trang thai service.
 4. Kiem tra bao cao doanh thu daily va doi soat du lieu thanh toan.

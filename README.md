@@ -5,7 +5,7 @@ Bot Telegram bán gói thành viên VIP cho nhóm nhạc, quản trị hoàn to�
 ## Yêu cầu hệ thống
 
 - Python 3.12+
-- PostgreSQL 15+
+- PostgreSQL 14+
 
 ---
 
